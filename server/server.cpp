@@ -1,0 +1,272 @@
+#include "../libs/middle.h"
+
+int epollfd;
+
+/*
+ * clientNode : if the client be ready
+ * cleintOver : if the client compelete uploading data
+ * hasNotify  : if has notify the first client to start testing
+ */
+int clientNode[CLIENTNUM];
+int clientOver[CLIENTNUM];
+bool hasNotify = false;
+
+/*
+ * The the first Client
+ */
+struct myevent * zeroClient;
+
+/*
+ * Epoll Event
+ */
+struct myevent myevents[MAXEPOLLSIZE+MAXSOCK];
+struct epoll_event events[MAXEPOLLSIZE];
+
+/**************************************************
+ * Check if all the client be ready.
+ **************************************************/
+bool checkClientReady(){
+	printf("Client ready status: ");
+	for(int i=0; i<CLIENTNUM; i++){
+		printf("%d,",clientNode[i]);
+	}
+	printf("\n");
+	for(int i=0; i<CLIENTNUM; i++){
+		if(clientNode[i] != 1)
+			return false;
+	}
+	return true;
+}
+
+/**************************************************
+ * Check if all the client compelete uploading data.
+ *************************************************/
+bool checkClientOver(){
+	for(int i=0; i<CLIENTNUM; i++){
+		if(clientOver[i] == 0)
+			return false;
+	}
+	return true;
+}
+
+/***************************************************
+ * Handle EpollIN Event
+ ***************************************************/
+void recvMessage(struct myevent * ev){
+	int sockfd = ev->sockfd;
+	ssize_t n = 0;
+	char buf[MAXLINE+1];
+	memset(buf, 0, sizeof(buf));
+	n = read(sockfd, buf, MAXLINE);
+	struct transUnit * comm = (struct transUnit *)buf;
+	switch(ev->type){
+		case WAITREADY :
+			if(ev->id == 0){
+				zeroClient = ev;
+			}
+			if(comm->request == READYOK){
+				clientNode[ev->id] = 1;
+				ev->type = WAITRESULT;
+				addEvent(epollfd, EPOLLIN|EPOLLET, ev);
+			}
+			if(checkClientReady() && !hasNotify){
+				hasNotify = true;
+				zeroClient->type = START;
+				addEvent(epollfd, EPOLLOUT|EPOLLET, zeroClient);
+			}
+			break;
+		/*Server wait to the client to upload data, and save to the test.txt in "bin/" */
+		case WAITRESULT :
+			if(comm->request == WAITRESULT){
+				char filename[20];
+				sprintf(filename, "test-%d.txt", ev->id);
+				ev->filefd = open(filename,O_APPEND|O_WRONLY|O_CREAT, 0777);
+				printf("%s\n",comm->res);
+				int i=0;
+				while(comm->res[i] != '\0'){
+					i++;
+				}
+				comm->res[i] = '\n';
+				write(ev->filefd, comm->res, i+1);
+				if(n != MAXLINE){
+					clientOver[ev->id] = 1;
+					close(ev->filefd);
+					delEvent(epollfd, ev);
+					printf("Upload Successfully\n");
+					return;
+				}
+			}
+			addEvent(epollfd, EPOLLIN|EPOLLET, ev);
+			break;
+		/*Server receive the client registration*/
+		case INIT :
+			ev->id = comm->testID;
+			printf("Server receive client %d registration\n", ev->id);
+			addEvent(epollfd, EPOLLOUT|EPOLLET, ev);
+			break;
+		default:
+			break;
+	}
+}
+
+/***************************************************
+ * Handle EpollOUT Event
+ ***************************************************/
+
+void sendMessage(struct myevent * ev){
+	int n = 0;
+	struct transUnit tu;
+	switch(ev->type){
+		/*Server tell client be ready*/
+		case INIT :
+			tu.fromServer = true;
+			tu.request = READY;
+			n = write(ev->sockfd, (char *)(&tu), sizeof(tu));
+			if(n <= 0){
+				printf("Failed: Server notify clients\n");
+			}else{
+				printf("Server notify client %d be ready\n",ev->id);
+			}
+			ev->type = WAITREADY;
+			addEvent(epollfd, EPOLLIN|EPOLLET, ev);
+			break;
+		/*Server tell the first client start sending raw packet*/
+		case START :
+			tu.fromServer = true;
+			tu.request = START;
+			n = write(ev->sockfd, (char *)(&tu), sizeof(tu));
+			if(n <= 0){
+				printf("Failed: Server notify the first client starting testing\n");
+			}else{
+				printf("Server notify the first client starting testing\n");
+			}
+			ev->type = WAITRESULT;
+			addEvent(epollfd, EPOLLIN|EPOLLET, ev);
+			break;
+		default:
+			break;
+	}
+}
+
+int main(int argc, char ** argv)
+{	
+	/*Test command is allowable*/
+	if(argc != 1){
+		printf("Usage : ./server\n");
+		return 0;
+	}
+	
+	/*Init the client status, 0 for initial, 1 for ready*/
+	for(int i=0; i<CLIENTNUM; i++){
+		clientNode[i] = 0;
+	}
+	
+	/*Init the client status, 0 for initial, 1 for over*/
+	for(int i=0; i<CLIENTNUM; i++){
+		clientOver[i] = 0;
+	}
+	
+	/*Init epollfd and server host information*/
+	epollfd = epoll_create(MAXEPOLLSIZE);
+	if(epollfd < 0){
+		printf("Create Epoll Failed!\n");
+		return 0;
+	}
+	struct addrinfo hints, *res;
+	bzero(&hints, sizeof(struct addrinfo));
+	hints.ai_flags = AI_PASSIVE;
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	if(getaddrinfo(NULL, SERVERPORT, &hints, &res) != 0){
+		printf("Set Server Port:%s Wrong!\n", SERVERPORT);
+		return 0;
+	}
+	
+	/*Init the listen socket*/
+	int listenfd[MAXSOCK], connfd;
+	int smax = 0;
+	do{
+		if(smax == MAXSOCK)
+			break;
+		listenfd[smax] = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+		if(listenfd[smax] < 0)
+			continue;
+		
+		int opt = 1;
+		if(res->ai_family == AF_INET6){
+			setsockopt(listenfd[smax],IPPROTO_IPV6, IPV6_V6ONLY, (char*)&opt, sizeof(opt));
+		}
+		
+   		setsockopt(listenfd[smax], SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+   		
+   		if (fcntl(listenfd[smax], F_SETFL, fcntl(listenfd[smax], F_GETFD, 0)|O_NONBLOCK) == -1) {
+    		continue;
+    		}
+    		
+    		initEvent(&myevents[MAXEPOLLSIZE+MAXSOCK-1-smax], listenfd[smax], LISTENFD, smax, 0);
+    		addEvent(epollfd, EPOLLIN|EPOLLET, &myevents[MAXEPOLLSIZE+MAXSOCK-1-smax]);
+    		
+		if(bind(listenfd[smax], res->ai_addr, res->ai_addrlen) == -1){
+			continue;
+		}
+		if(listen(listenfd[smax], LISTENQ) == -1){
+			continue;
+		}
+		smax++;
+	}while((res = res->ai_next) != NULL);
+	
+	/*Assertion server is working*/
+	if(smax == 0){
+		printf("Init Server Error!\n");
+		return 0;
+	}else
+		printf("Server is Working!\n");
+
+	/*Do with socket handle*/
+	int fds = 0;
+	struct sockaddr_in cliaddr;
+	socklen_t clilen;
+	while(!checkClientOver()){
+		fds = epoll_wait(epollfd, events, MAXEPOLLSIZE, -1);
+        if (fds == -1){
+            printf("Warning : epoll wait fd number is -1");
+            continue;
+        }
+
+        for (int i=0; i<fds; i++){
+        	myevent *ev = (struct myevent *)events[i].data.ptr;
+        	
+            if (ev->type == LISTENFD){
+                connfd = accept(listenfd[ev->index], (struct sockaddr *)&cliaddr,&clilen);
+                if (connfd < 0){
+                	printf("Accept Failed\n");
+                    continue;
+                }
+                int pos = 0;
+				for(pos=0; pos<MAXEPOLLSIZE; pos++){
+					if(myevents[pos].status == 0)
+						break;
+				}
+                if (pos == MAXEPOLLSIZE) {
+                    printf("Connection More Than %d!\n", MAXEPOLLSIZE);
+                    close(connfd);
+                    continue;
+                } 
+                if (fcntl(connfd, F_SETFL, fcntl(listenfd[ev->index], F_GETFD, 0)|O_NONBLOCK) == -1) {
+                    perror("Set Non-Blocking Wrong\n");
+                }
+                
+                printf("New Client is Accept!\n");
+                initEvent(&myevents[pos], connfd, INIT, 0, -1); 
+      		    addEvent(epollfd, EPOLLIN|EPOLLET, &myevents[pos]); 
+                continue;
+            } 
+            if(ev->events&EPOLLIN){
+            	recvMessage(ev);
+            }else if(ev->events&EPOLLOUT){
+            	sendMessage(ev);
+            }
+        }
+	}
+	return 0;
+}

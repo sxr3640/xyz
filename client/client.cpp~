@@ -1,0 +1,287 @@
+#include "../libs/middle.h"
+
+int epollfd;
+
+/*
+ * sendsd : raw socket of send raw packet
+ * recvsd : raw socket of receive raw packet 
+ */
+int sendsd;
+int recvsd;
+
+/*
+ * sendNum : the sum of send raw packet
+ * recvNum : the sum of receive raw packet
+ */
+int sendNum = 0;
+int recvNum = 0;
+
+/*
+ * testID : the type of test
+ * id     : the unique id of client
+ * result : the result of check the receiving raw packet
+ * over   : if client compelete its work
+ */
+int testID;
+int id;
+int result[5];
+bool over = false;
+
+/*
+ * Epoll Event
+ */
+struct myevent myevents[3];
+struct epoll_event events[MAXEPOLLSIZE];
+
+/***************************************************
+ * Handle EpollIN Event
+ ***************************************************/
+void recvMessage(struct myevent * ev){
+	int sockfd = ev->sockfd;
+	ssize_t n = 0;
+	char buf[MAXLINE+1];
+	memset(buf, 0, sizeof(buf));
+	if(ev->type == RECVNEXT && recvNum != 5){
+		char buffer[2048];
+		struct iphdr* ip_reply;
+		char *iphead, *p;
+		if((n = recvfrom(sockfd, buffer, 2048, 0, NULL, NULL)) < 42){
+			printf("Too short\n");
+		}else{
+			iphead = buffer + 14;
+			p = iphead + 12;
+			ip_reply = (struct iphdr*)iphead;
+			if(ntohs(ip_reply->id) == 3893){
+				result[recvNum] = check(buffer, testID, id);
+        		recvNum++;
+				printf("IP:%d.%d.%d.%d => %d.%d.%d.%d\n",p[0]&0XFF,p[1]&0XFF,p[2]&0XFF,p[3]&0XFF,
+					p[4]&0XFF,p[5]&0XFF,p[6]&0XFF,p[7]&0XFF);
+        	}
+		}
+		addEvent(epollfd, EPOLLIN|EPOLLET, ev);
+	}else {
+		n = read(sockfd, buf, MAXLINE);
+		struct transUnit * comm = (struct transUnit *)buf;
+		struct transUnit sendUnit;
+		if(comm->fromServer){
+			switch (comm->request){
+				case READY:
+					ev->type = CONTROL;
+					addEvent(epollfd, EPOLLOUT|EPOLLET, ev);
+					printf("Receive server's ready command!\n");
+					break;
+				case START:
+					printf("Receive server's start command!\n");
+					ev->type = DATA;
+					addEvent(epollfd, EPOLLOUT|EPOLLET, ev);
+					initEvent(&myevents[0], sendsd, SENDNEXT, 0, -1);
+					addEvent(epollfd, EPOLLOUT|EPOLLET, &myevents[0]);
+					break;
+			}
+		}
+    }
+}
+
+/***************************************************
+ * Handle EpollOUT Event
+ ***************************************************/
+void sendMessage(struct myevent * ev){
+	char buf[MAXLINE+1];
+	memset(buf, 0, sizeof(buf));
+	int nn = 0;
+	int sockfd = ev->sockfd;
+	int filefd = ev->filefd;
+	struct transUnit sendUnit;
+	switch(ev->type){
+		/*Send registration information to server*/
+		case INIT :
+			sendUnit.fromServer = false;
+			sendUnit.testID = ev->id;
+			ev->unit = (char*)(&sendUnit);
+			nn = write(sockfd, ev->unit, sizeof(struct transUnit));
+			if(nn < 0){
+				printf("Send registration failed\n");
+				return ;
+			}else
+				printf("Send registration successfully\n");
+			addEvent(epollfd, EPOLLIN|EPOLLET, ev);
+			break;
+		/*Upload Data when client complete testing*/
+		case DATA :
+			if((ev->id == 0 && sendNum == 5) || (ev->id != 0 && recvNum == 5)){
+				sendUnit.fromServer = false;
+				sendUnit.request = WAITRESULT;
+				if(ev->id == 0){
+					sprintf(sendUnit.res, "0,0,0,0,0\0");
+				}else
+					sprintf(sendUnit.res,"%d,%d,%d,%d,%d\0", result[0], result[1], result[2], result[3], result[4]);
+				printf("%s\n",sendUnit.res);
+				ev->unit = (char*)(&sendUnit);
+				nn = write(sockfd, ev->unit, sizeof(struct transUnit));
+				if(nn < 0){
+					printf("Can not send\n");
+					return ;
+				}else if(nn != MAXLINE){
+					delEvent(epollfd, ev);
+					printf("Send %d Data Successfully\n", nn);
+					over = true;
+					return;
+				}
+			}else{
+				addEvent(epollfd, EPOLLOUT|EPOLLET, ev);
+			}
+			break;
+		/*Clieng prepare to receive raw packet except the first client*/
+		case CONTROL :
+			sendUnit.fromServer = false;
+			sendUnit.request = READYOK;
+			ev->unit = (char*)(&sendUnit);
+			nn = write(sockfd, ev->unit, sizeof(struct transUnit));
+			if(nn < 0){
+				printf("Send Control Message Failed\n");
+				return ;
+			}
+			if(ev->id != 0){
+				printf("Begin receive raw socket\n");
+				ev->type = DATA;
+				addEvent(epollfd, EPOLLOUT|EPOLLET, ev);
+				initEvent(&myevents[1], recvsd, RECVNEXT, 0, -1);
+				addEvent(epollfd, EPOLLIN|EPOLLET, &myevents[1]);
+				return;
+			}
+			addEvent(epollfd, EPOLLIN|EPOLLET, ev);
+			break;
+		/*The first Client send raw packet*/
+		case SENDNEXT :
+			struct iphdr* ip;
+			struct icmphdr* icmp;
+			struct sockaddr_in connection;
+			char packet[sizeof(struct iphdr) + sizeof(struct icmphdr)];
+		 
+			ip = (struct iphdr*) packet;
+			icmp = (struct icmphdr*) (packet + sizeof(struct iphdr));
+		 
+			ip->ihl          = 5;
+			ip->version      = 4;
+			ip->tos          = 0;
+			ip->tot_len      = sizeof(struct iphdr) + sizeof(struct icmphdr);
+			ip->id           = htons(3893);
+			ip->ttl          = 255;
+			ip->protocol     = IPPROTO_ICMP;
+			ip->saddr        = inet_addr("192.168.1.129");
+			ip->daddr        = inet_addr("192.168.1.108");
+	 
+			icmp->type               = ICMP_ECHO;
+			icmp->code               = 0;
+			icmp->un.echo.id         = 0;
+			icmp->un.echo.sequence   = 0;
+			icmp->checksum           = 0;
+			icmp-> checksum          = in_cksum((unsigned short *)icmp, sizeof(struct icmphdr));
+		
+			ip->check                = in_cksum((unsigned short *)ip, sizeof(struct iphdr));
+		 
+			connection.sin_family = AF_INET;
+			connection.sin_addr.s_addr = inet_addr("192.168.1.108");
+		 
+			if(sendNum != 5){
+				if((nn = sendto(sockfd, packet, ip->tot_len, 0, (struct sockaddr *)&connection, sizeof(struct sockaddr))) < 0){
+					perror("sendto() error");
+					exit(-1);
+				}else{
+					printf("%d: raw socket sendto() is OK, length is %d.\n",sendNum, nn);
+					sendNum++;
+				}
+				addEvent(epollfd, EPOLLOUT|EPOLLET, ev);
+				return;
+			}
+			break;
+		default:
+			break;
+	}
+}
+
+int main(int argc, char ** argv)
+{	
+	/*Test command is allowable*/
+	if(argc != 3){
+		printf("./client <address> <id>");
+		return 0;
+	}
+	id = atoi(argv[2]);	
+	  
+	/*Init epollfd and server host information*/ 
+	epollfd = epoll_create(MAXEPOLLSIZE);
+	if(epollfd < 0){
+		printf("Create Epoll Failed!\n");
+		return 0;
+	}
+	
+	/*Init the raw socket*/
+	sendsd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+	if(sendsd < 0){
+		perror("raw socket() error");
+		return 0;
+	}else
+		printf("create raw socket successfully\n");
+	int one = 1;
+	const int *val = &one;
+	if(setsockopt(sendsd, IPPROTO_IP, IP_HDRINCL, val, sizeof(one)) < 0){
+		perror("setsockopt() error");
+		exit(-1);
+	}else
+		printf("setsockopt() is OK.\n");
+		
+	recvsd = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_IP));
+	if(recvsd < 0){
+		perror("raw socket() error");
+		return 0;
+	}else
+		printf("create raw socket successfully\n");
+		
+	/*Connect to Server*/
+	int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+	struct sockaddr_in servaddr;
+	memset(&servaddr, 0, sizeof(servaddr));
+	servaddr.sin_family = AF_INET;
+	servaddr.sin_port = htons(atoi(SERVERPORT));
+	inet_pton(AF_INET, argv[1],  &servaddr.sin_addr);
+	if(connect(sockfd, (sockaddr *)&servaddr, sizeof(servaddr)) < 0){
+		printf("Connect server failed\n");
+		return 0;
+	}else
+		printf("Connect server successfully\n");
+	int opt = 1;
+	setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+	if(fcntl(sockfd, F_SETFL, fcntl(sockfd, F_GETFD, 0)|O_NONBLOCK) == -1){
+		printf("Set socket option failed\n");
+		return 0;
+	}
+	initEvent(&myevents[2], sockfd, INIT, 0, id);
+	addEvent(epollfd, EPOLLOUT|EPOLLET, &myevents[2]);
+	
+
+	/*Do with socket handle*/
+	int fds = 0;
+	struct sockaddr_in cliaddr;
+	socklen_t clilen;
+	while(!over){
+		fds = epoll_wait(epollfd, events, MAXEPOLLSIZE, -1);
+        if (fds == -1)
+        {
+            printf("Warning : epoll wait fd number is -1");
+            continue;
+        }
+
+        for (int i=0; i<fds; i++)
+        {
+        	myevent *ev = (struct myevent *)events[i].data.ptr;
+            if(ev->events&EPOLLIN){
+            	recvMessage(ev);
+            }else if(ev->events&EPOLLOUT){
+            	sendMessage(ev);
+            }
+        }
+	}
+
+	return 0;
+}
